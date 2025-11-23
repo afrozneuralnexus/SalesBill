@@ -1,220 +1,333 @@
-import streamlit as st
-import cv2
 import numpy as np
-import pytesseract
-from PIL import Image
+import cv2
+import matplotlib.pyplot as plt
 import re
-import tempfile
+import pytesseract
+from pytesseract import Output
+from skimage.filters import threshold_local
+from PIL import Image
+import pandas as pd
+from datetime import datetime
 import os
+from google.colab.patches import cv2_imshow
 
-# Set page configuration
-st.set_page_config(
-    page_title="Hotel Bill OCR",
-    page_icon="🧾",
-    layout="wide"
-)
+# Install required packages
+!sudo apt install tesseract-ocr
+!pip install pytesseract scikit-image openpyxl pandas
 
-def preprocess_image(image):
-    """Preprocess image for OCR"""
-    try:
-        # Convert to grayscale
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image
-        
-        # Apply noise reduction
-        denoised = cv2.medianBlur(gray, 3)
-        
-        # Apply adaptive thresholding
-        binary = cv2.adaptiveThreshold(
-            denoised, 
-            255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            11, 
-            10
-        )
-        
-        return binary, denoised
-    except Exception as e:
-        st.error(f"Error in preprocessing: {e}")
-        # Return original images if preprocessing fails
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-            return gray, gray
-        return image, image
+def load_and_preprocess_image(image_path):
+    """Load and preprocess the image"""
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
 
-def extract_text(image):
+def enhance_image_quality(image):
+    """Enhance image quality for better OCR"""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    denoised = cv2.medianBlur(gray, 3)
+    T = threshold_local(denoised, 11, offset=10, method="gaussian")
+    binary = (denoised > T).astype("uint8") * 255
+    return binary, denoised
+
+def extract_text_from_image(image):
     """Extract text using pytesseract"""
-    try:
-        # Try different configurations for better results
-        configs = [
-            r'--oem 3 --psm 6',
-            r'--oem 3 --psm 4',
-            r'--oem 3 --psm 3'
-        ]
+    custom_config = r'--oem 3 --psm 6'
+    text_basic = pytesseract.image_to_string(image, config=custom_config)
+    detailed_data = pytesseract.image_to_data(image, output_type=Output.DICT)
+    return text_basic, detailed_data
+
+def extract_hotel_info(text):
+    """Extract hotel name and address"""
+    lines = text.split('\n')
+    hotel_name = ""
+    address = ""
+    
+    # Usually hotel name is in the first few lines
+    for i, line in enumerate(lines[:5]):
+        if line.strip() and len(line.strip()) > 5:
+            if not hotel_name:
+                hotel_name = line.strip()
+            elif not address and i > 0:
+                address = line.strip()
+                break
+    
+    return hotel_name, address
+
+def extract_dates(text):
+    """Extract check-in and check-out dates"""
+    date_patterns = [
+        r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}',
+        r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}',
+        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}'
+    ]
+    
+    dates = []
+    for pattern in date_patterns:
+        found_dates = re.findall(pattern, text, re.IGNORECASE)
+        dates.extend(found_dates)
+    
+    check_in = dates[0] if len(dates) > 0 else ""
+    check_out = dates[1] if len(dates) > 1 else ""
+    
+    return check_in, check_out
+
+def extract_guest_info(text):
+    """Extract guest name and room number"""
+    guest_name = ""
+    room_number = ""
+    
+    # Look for guest name patterns
+    guest_patterns = [
+        r'(?:Guest|Name|Mr\.|Mrs\.|Ms\.)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+        r'(?:Guest Name|Customer)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)'
+    ]
+    
+    for pattern in guest_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            guest_name = match.group(1)
+            break
+    
+    # Look for room number
+    room_patterns = [
+        r'(?:Room|Rm)\s*(?:No|Number|#)?\.?\s*:?\s*(\d+)',
+        r'Room\s+(\d+)'
+    ]
+    
+    for pattern in room_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            room_number = match.group(1)
+            break
+    
+    return guest_name, room_number
+
+def extract_line_items(text):
+    """Extract itemized charges"""
+    items = []
+    lines = text.split('\n')
+    
+    # Pattern to match line items with amounts
+    item_pattern = r'(.+?)\s+(\$?\d+[,.]?\d*\.?\d{2})'
+    
+    for line in lines:
+        # Skip header lines and total lines
+        if any(keyword in line.lower() for keyword in ['total', 'subtotal', 'tax', 'balance', 'amount due']):
+            continue
         
-        best_text = ""
-        for config in configs:
+        match = re.search(item_pattern, line)
+        if match:
+            description = match.group(1).strip()
+            amount = match.group(2).replace('$', '').replace(',', '')
+            
+            # Filter out noise
+            if len(description) > 3 and description[0].isalpha():
+                try:
+                    amount_float = float(amount)
+                    if amount_float > 0:
+                        items.append({
+                            'description': description,
+                            'amount': amount_float
+                        })
+                except ValueError:
+                    pass
+    
+    return items
+
+def extract_totals(text):
+    """Extract financial totals"""
+    subtotal = 0.0
+    tax = 0.0
+    total = 0.0
+    
+    # Patterns for different total types
+    patterns = {
+        'subtotal': r'(?:Subtotal|Sub Total)\s*:?\s*\$?\s*(\d+[,.]?\d*\.?\d{2})',
+        'tax': r'(?:Tax|GST|VAT)\s*:?\s*\$?\s*(\d+[,.]?\d*\.?\d{2})',
+        'total': r'(?:Total|Grand Total|Amount Due|Balance)\s*:?\s*\$?\s*(\d+[,.]?\d*\.?\d{2})'
+    }
+    
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = match.group(1).replace('$', '').replace(',', '')
             try:
-                text = pytesseract.image_to_string(image, config=config)
-                if len(text.strip()) > len(best_text.strip()):
-                    best_text = text
-            except:
-                continue
-        
-        if not best_text.strip():
-            # Fallback to basic config
-            best_text = pytesseract.image_to_string(image)
-        
-        # Clean up text
-        text = re.sub(r'\s+', ' ', best_text).strip()
-        text = re.sub(r'\s\w\s', ' ', text)
-        
-        return text
-    except Exception as e:
-        st.error(f"Error in text extraction: {e}")
-        return ""
-
-def main():
-    st.title("🧾 Hotel Bill OCR Processor")
-    st.markdown("Upload a hotel bill image to extract text using OCR")
+                if key == 'subtotal':
+                    subtotal = float(value)
+                elif key == 'tax':
+                    tax = float(value)
+                elif key == 'total':
+                    total = float(value)
+            except ValueError:
+                pass
     
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Choose a hotel bill image", 
-        type=['jpg', 'jpeg', 'png'],
-        help="Upload a clear image of a hotel bill for text extraction"
-    )
-    
-    if uploaded_file is not None:
-        try:
-            # Display uploaded image
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Uploaded Image")
-                image = Image.open(uploaded_file)
-                st.image(image, use_column_width=True)
-                
-                # Convert to OpenCV format
-                image_cv = np.array(image)
-                if len(image_cv.shape) == 3:
-                    image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
-                    image_cv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-            
-            with col2:
-                st.subheader("Processing Options")
-                process_option = st.radio(
-                    "Select processing method:",
-                    ["Automatic (Recommended)", "Grayscale only", "Binary only"]
-                )
-                
-                if st.button("Extract Text", type="primary"):
-                    with st.spinner("Processing image and extracting text..."):
-                        # Preprocess image
-                        binary_img, gray_img = preprocess_image(image_cv)
-                        
-                        # Extract text based on selected option
-                        if process_option == "Automatic (Recommended)":
-                            text_binary = extract_text(binary_img)
-                            text_gray = extract_text(gray_img)
-                            final_text = text_binary if len(text_binary) > len(text_gray) else text_gray
-                            used_method = "Binary" if len(text_binary) > len(text_gray) else "Grayscale"
-                        elif process_option == "Grayscale only":
-                            final_text = extract_text(gray_img)
-                            used_method = "Grayscale"
-                        else:
-                            final_text = extract_text(binary_img)
-                            used_method = "Binary"
-                        
-                        # Display results
-                        st.subheader("📄 Extracted Text")
-                        st.info(f"Used method: {used_method}")
-                        
-                        if final_text.strip():
-                            # Text area for easy copying
-                            st.text_area(
-                                "Extracted Text", 
-                                final_text, 
-                                height=200,
-                                help="You can copy the extracted text from here"
-                            )
-                            
-                            # Display processed images
-                            st.subheader("🖼️ Processed Images")
-                            proc_col1, proc_col2 = st.columns(2)
-                            
-                            with proc_col1:
-                                st.image(gray_img, caption="Grayscale Image", use_column_width=True, clamp=True)
-                            
-                            with proc_col2:
-                                st.image(binary_img, caption="Binary Image", use_column_width=True, clamp=True)
-                            
-                            # Download extracted text
-                            st.download_button(
-                                label="📥 Download Extracted Text",
-                                data=final_text,
-                                file_name="extracted_bill_text.txt",
-                                mime="text/plain"
-                            )
-                        else:
-                            st.warning("No text could be extracted from the image. Please try with a clearer image.")
-        
-        except Exception as e:
-            st.error(f"Error processing image: {str(e)}")
-            st.info("Please try uploading a different image or check the image format.")
-    
-    else:
-        # Show instructions when no file is uploaded
-        st.info("👆 Please upload a hotel bill image to get started")
-        
-        # Sample usage instructions
-        with st.expander("ℹ️ How to get best results"):
-            st.markdown("""
-            ### Tips for Best Results:
-            
-            - **Use clear, high-resolution images**
-            - **Ensure good lighting** when taking photos
-            - **Position the bill straight** and avoid angles
-            - **Include the entire bill** in the frame
-            - **Avoid shadows and glares** on the bill
-            
-            ### Supported Formats:
-            - JPG, JPEG, PNG
-            
-            ### Note:
-            This app uses Tesseract OCR for text extraction. 
-            For best results, ensure your images are clear and well-lit.
-            """)
+    return subtotal, tax, total
 
-    # Add information about the app
-    with st.sidebar:
-        st.header("About")
-        st.markdown("""
-        This app uses OCR (Optical Character Recognition) to extract text from hotel bill images.
-        
-        **Features:**
-        - Multiple image preprocessing techniques
-        - Automatic text extraction
-        - Download extracted text
-        
-        **Technology Stack:**
-        - Streamlit
-        - OpenCV
-        - Tesseract OCR
-        - Pillow (PIL)
-        """)
-        
-        st.header("Troubleshooting")
-        st.markdown("""
-        If you encounter issues:
-        1. Try a different image
-        2. Ensure the image is clear
-        3. Check file format (JPG/PNG)
-        4. Try the 'Grayscale only' option
-        """)
+def extract_invoice_number(text):
+    """Extract invoice/bill number"""
+    patterns = [
+        r'(?:Invoice|Bill|Receipt)\s*(?:No|Number|#)?\.?\s*:?\s*([A-Z0-9-]+)',
+        r'(?:Folio|Confirmation)\s*(?:No|Number|#)?\.?\s*:?\s*([A-Z0-9-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    
+    return ""
 
+def process_hotel_bill(image_path):
+    """Main function to process hotel bill and extract structured data"""
+    print("Loading image...")
+    original_image = load_and_preprocess_image(image_path)
+    
+    print("Enhancing image quality...")
+    binary_image, gray_image = enhance_image_quality(original_image)
+    
+    print("Extracting text from enhanced image...")
+    text_binary, _ = extract_text_from_image(binary_image)
+    
+    print("Extracting text from grayscale image...")
+    text_gray, _ = extract_text_from_image(gray_image)
+    
+    # Use the better result
+    final_text = text_binary if len(text_binary) > len(text_gray) else text_gray
+    
+    print("Extracting structured data...")
+    
+    # Extract all information
+    hotel_name, address = extract_hotel_info(final_text)
+    check_in, check_out = extract_dates(final_text)
+    guest_name, room_number = extract_guest_info(final_text)
+    invoice_number = extract_invoice_number(final_text)
+    line_items = extract_line_items(final_text)
+    subtotal, tax, total = extract_totals(final_text)
+    
+    # Display extracted text
+    print("\n=== EXTRACTED TEXT ===")
+    print("-" * 50)
+    print(final_text)
+    print("-" * 50)
+    
+    # Display images
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    axes[0].imshow(original_image)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+    
+    axes[1].imshow(gray_image, cmap='gray')
+    axes[1].set_title('Grayscale Image')
+    axes[1].axis('off')
+    
+    axes[2].imshow(binary_image, cmap='gray')
+    axes[2].set_title('Binary Image')
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'hotel_name': hotel_name,
+        'address': address,
+        'invoice_number': invoice_number,
+        'guest_name': guest_name,
+        'room_number': room_number,
+        'check_in_date': check_in,
+        'check_out_date': check_out,
+        'line_items': line_items,
+        'subtotal': subtotal,
+        'tax': tax,
+        'total': total,
+        'raw_text': final_text
+    }
+
+def save_to_excel(results, output_filename='hotel_bill_data.xlsx'):
+    """Save extracted data to Excel with multiple sheets"""
+    
+    # Create a Pandas Excel writer
+    with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+        
+        # Sheet 1: Summary Information
+        summary_data = {
+            'Field': [
+                'Hotel Name',
+                'Address',
+                'Invoice Number',
+                'Guest Name',
+                'Room Number',
+                'Check-in Date',
+                'Check-out Date',
+                'Subtotal',
+                'Tax',
+                'Total Amount'
+            ],
+            'Value': [
+                results['hotel_name'],
+                results['address'],
+                results['invoice_number'],
+                results['guest_name'],
+                results['room_number'],
+                results['check_in_date'],
+                results['check_out_date'],
+                f"${results['subtotal']:.2f}" if results['subtotal'] else '',
+                f"${results['tax']:.2f}" if results['tax'] else '',
+                f"${results['total']:.2f}" if results['total'] else ''
+            ]
+        }
+        
+        df_summary = pd.DataFrame(summary_data)
+        df_summary.to_excel(writer, sheet_name='Summary', index=False)
+        
+        # Sheet 2: Line Items
+        if results['line_items']:
+            df_items = pd.DataFrame(results['line_items'])
+            df_items['amount'] = df_items['amount'].apply(lambda x: f"${x:.2f}")
+            df_items.to_excel(writer, sheet_name='Line Items', index=False)
+        
+        # Sheet 3: Raw Text
+        df_raw = pd.DataFrame({'Raw Extracted Text': [results['raw_text']]})
+        df_raw.to_excel(writer, sheet_name='Raw Text', index=False)
+    
+    print(f"\n✅ Data saved to {output_filename}")
+    
+    # Display summary
+    print("\n=== EXTRACTED DATA SUMMARY ===")
+    print(f"Hotel Name: {results['hotel_name']}")
+    print(f"Guest Name: {results['guest_name']}")
+    print(f"Room Number: {results['room_number']}")
+    print(f"Invoice Number: {results['invoice_number']}")
+    print(f"Check-in: {results['check_in_date']}")
+    print(f"Check-out: {results['check_out_date']}")
+    print(f"\nFinancial Summary:")
+    print(f"  Subtotal: ${results['subtotal']:.2f}")
+    print(f"  Tax: ${results['tax']:.2f}")
+    print(f"  Total: ${results['total']:.2f}")
+    print(f"\nLine Items Found: {len(results['line_items'])}")
+
+# Main execution for Colab
 if __name__ == "__main__":
-    main()
+    from google.colab import files
+    
+    print("Please upload your hotel bill image...")
+    uploaded = files.upload()
+    
+    image_files = list(uploaded.keys())
+    if image_files:
+        image_path = image_files[0]
+        print(f"\nProcessing: {image_path}")
+        
+        # Process the image and extract data
+        results = process_hotel_bill(image_path)
+        
+        # Save to Excel
+        output_filename = 'hotel_bill_data.xlsx'
+        save_to_excel(results, output_filename)
+        
+        # Download the Excel file
+        files.download(output_filename)
+        
+        print("\n✅ Processing completed! Excel file has been downloaded.")
+    else:
+        print("No files uploaded.")
