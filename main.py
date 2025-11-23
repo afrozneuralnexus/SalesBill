@@ -4,7 +4,6 @@ import numpy as np
 import pytesseract
 from PIL import Image
 import re
-import pickle
 import tempfile
 import os
 
@@ -15,44 +14,62 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom preprocessing function (simpler alternative to scikit-image)
-def custom_threshold_local(image, block_size=11, offset=10):
-    """Custom implementation of local thresholding"""
-    # Simple adaptive thresholding as alternative
-    return cv2.adaptiveThreshold(
-        image, 
-        255, 
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 
-        block_size, 
-        offset
-    )
-
 def preprocess_image(image):
     """Preprocess image for OCR"""
     try:
         # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image
         
         # Apply noise reduction
         denoised = cv2.medianBlur(gray, 3)
         
-        # Apply thresholding (using custom function)
-        binary = custom_threshold_local(denoised, 11, 10)
+        # Apply adaptive thresholding
+        binary = cv2.adaptiveThreshold(
+            denoised, 
+            255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            11, 
+            10
+        )
         
         return binary, denoised
     except Exception as e:
         st.error(f"Error in preprocessing: {e}")
+        # Return original images if preprocessing fails
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            return gray, gray
         return image, image
 
 def extract_text(image):
     """Extract text using pytesseract"""
     try:
-        custom_config = r'--oem 3 --psm 6'
-        text = pytesseract.image_to_string(image, config=custom_config)
+        # Try different configurations for better results
+        configs = [
+            r'--oem 3 --psm 6',
+            r'--oem 3 --psm 4',
+            r'--oem 3 --psm 3'
+        ]
+        
+        best_text = ""
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(image, config=config)
+                if len(text.strip()) > len(best_text.strip()):
+                    best_text = text
+            except:
+                continue
+        
+        if not best_text.strip():
+            # Fallback to basic config
+            best_text = pytesseract.image_to_string(image)
         
         # Clean up text
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r'\s+', ' ', best_text).strip()
         text = re.sub(r'\s\w\s', ' ', text)
         
         return text
@@ -72,38 +89,30 @@ def main():
     )
     
     if uploaded_file is not None:
-        # Display uploaded image
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Uploaded Image")
-            image = Image.open(uploaded_file)
-            st.image(image, use_column_width=True)
+        try:
+            # Display uploaded image
+            col1, col2 = st.columns(2)
             
-            # Convert to OpenCV format
-            image_cv = np.array(image)
-            if len(image_cv.shape) == 3:
-                image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
-                image_cv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-        
-        with col2:
-            st.subheader("Processing Options")
-            process_option = st.radio(
-                "Select processing method:",
-                ["Automatic (Recommended)", "Grayscale only", "Binary only"]
-            )
+            with col1:
+                st.subheader("Uploaded Image")
+                image = Image.open(uploaded_file)
+                st.image(image, use_column_width=True)
+                
+                # Convert to OpenCV format
+                image_cv = np.array(image)
+                if len(image_cv.shape) == 3:
+                    image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
+                    image_cv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
             
-            confidence_threshold = st.slider(
-                "Confidence Level", 
-                min_value=1, 
-                max_value=10, 
-                value=6,
-                help="Higher values may extract less text but with higher accuracy"
-            )
-            
-            if st.button("Extract Text", type="primary"):
-                with st.spinner("Processing image and extracting text..."):
-                    try:
+            with col2:
+                st.subheader("Processing Options")
+                process_option = st.radio(
+                    "Select processing method:",
+                    ["Automatic (Recommended)", "Grayscale only", "Binary only"]
+                )
+                
+                if st.button("Extract Text", type="primary"):
+                    with st.spinner("Processing image and extracting text..."):
                         # Preprocess image
                         binary_img, gray_img = preprocess_image(image_cv)
                         
@@ -124,34 +133,38 @@ def main():
                         st.subheader("📄 Extracted Text")
                         st.info(f"Used method: {used_method}")
                         
-                        # Text area for easy copying
-                        st.text_area(
-                            "Extracted Text", 
-                            final_text, 
-                            height=200,
-                            help="You can copy the extracted text from here"
-                        )
-                        
-                        # Display processed images
-                        st.subheader("🖼️ Processed Images")
-                        proc_col1, proc_col2 = st.columns(2)
-                        
-                        with proc_col1:
-                            st.image(gray_img, caption="Grayscale Image", use_column_width=True, clamp=True)
-                        
-                        with proc_col2:
-                            st.image(binary_img, caption="Binary Image", use_column_width=True, clamp=True)
-                        
-                        # Download extracted text
-                        st.download_button(
-                            label="📥 Download Extracted Text",
-                            data=final_text,
-                            file_name="extracted_bill_text.txt",
-                            mime="text/plain"
-                        )
-                        
-                    except Exception as e:
-                        st.error(f"An error occurred during processing: {str(e)}")
+                        if final_text.strip():
+                            # Text area for easy copying
+                            st.text_area(
+                                "Extracted Text", 
+                                final_text, 
+                                height=200,
+                                help="You can copy the extracted text from here"
+                            )
+                            
+                            # Display processed images
+                            st.subheader("🖼️ Processed Images")
+                            proc_col1, proc_col2 = st.columns(2)
+                            
+                            with proc_col1:
+                                st.image(gray_img, caption="Grayscale Image", use_column_width=True, clamp=True)
+                            
+                            with proc_col2:
+                                st.image(binary_img, caption="Binary Image", use_column_width=True, clamp=True)
+                            
+                            # Download extracted text
+                            st.download_button(
+                                label="📥 Download Extracted Text",
+                                data=final_text,
+                                file_name="extracted_bill_text.txt",
+                                mime="text/plain"
+                            )
+                        else:
+                            st.warning("No text could be extracted from the image. Please try with a clearer image.")
+        
+        except Exception as e:
+            st.error(f"Error processing image: {str(e)}")
+            st.info("Please try uploading a different image or check the image format.")
     
     else:
         # Show instructions when no file is uploaded
@@ -160,15 +173,20 @@ def main():
         # Sample usage instructions
         with st.expander("ℹ️ How to get best results"):
             st.markdown("""
+            ### Tips for Best Results:
+            
             - **Use clear, high-resolution images**
             - **Ensure good lighting** when taking photos
             - **Position the bill straight** and avoid angles
             - **Include the entire bill** in the frame
             - **Avoid shadows and glares** on the bill
             
-            **Supported formats:** JPG, JPEG, PNG
+            ### Supported Formats:
+            - JPG, JPEG, PNG
             
-            **Note:** This app uses Tesseract OCR for text extraction. For best results, ensure your images are clear and well-lit.
+            ### Note:
+            This app uses Tesseract OCR for text extraction. 
+            For best results, ensure your images are clear and well-lit.
             """)
 
     # Add information about the app
@@ -188,11 +206,15 @@ def main():
         - Tesseract OCR
         - Pillow (PIL)
         """)
+        
+        st.header("Troubleshooting")
+        st.markdown("""
+        If you encounter issues:
+        1. Try a different image
+        2. Ensure the image is clear
+        3. Check file format (JPG/PNG)
+        4. Try the 'Grayscale only' option
+        """)
 
 if __name__ == "__main__":
-    # Note for deployment
-    st.sidebar.info("""
-    **Deployment Note:** 
-    For Streamlit Cloud deployment, ensure Tesseract OCR is available in the environment.
-    """)
     main()
